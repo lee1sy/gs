@@ -1,0 +1,37 @@
+data:
+  data_root_dir: "/mnt/nuscenes/"
+  info_path: "/mnt/nuscenes/nuscenes_infos_bs.pkl"
+  database_path: "/mnt/nuscenes/bs_db.npy"
+  train_query_path: "/mnt/nuscenes/bs_train_query.npy"
+  test_query_path: "/mnt/nuscenes/bs_test_query.npy"
+  val_query_path: "/mnt/nuscenes/bs_val_query.npy"
+
+
+  gaussian_path: "/home/james/LSY/11/nuscenes/"  # Path to Gaussian .npy files directory
+
+runner:
+  nonTrivPosDistThres: 9
+  posDistThr: 18
+  nNeg: 5
+  nNegSample: 1000
+  margin: 0.5
+  resize: [322, 574]
+
+#  optimizer
+  lr: 0.00001
+  step_size: 6
+  gamma: 0.5
+  num_epochs: 80
+
+#  training process
+  num_workers_train: 6
+  num_workers_test: 8
+#  resume_path: 'weights/LCPR_epoch_1.pth.tar'
+  resume_path: '/home/james/LSY/GSNET/weights/LCPR_epoch_4.pth.tar'
+  resume_scheduler: True
+  log: False
+
+  ckpt_dir: 'weights/'
+  result_dir: 'runs/results/'
+  cache_dir: 'runs/cache/'
+  log_dir: 'runs/logs/'
