@@ -62,13 +62,11 @@ class BaseDataset(Dataset):
         gaussian_data_path = os.path.join(self.gaussian_path, fname)
         
         if not os.path.exists(gaussian_data_path):
-            # print(f"File not found: {gaussian_data_path}")
             return torch.zeros(self.num_points, 14, dtype=torch.float32)
         
         try:
             gaussian_data = np.load(gaussian_data_path, allow_pickle=True)
-        except Exception as e:
-            print(f"Error loading {gaussian_data_path}: {e}")
+        except Exception:
             return torch.zeros(self.num_points, 14, dtype=torch.float32)
         
         if gaussian_data.shape[0] == 0:
@@ -89,26 +87,19 @@ class BaseDataset(Dataset):
     def load_camera_data(self, index, channels):
         imgs = []
         for channel in channels:
-            cam_data = self.infos[index]['cam_infos'][channel]
+            cam_data = self.infos[index]['camera_infos'][channel]
             filename = cam_data['filename']
             img_path = os.path.join(self.dataroot, filename)
             if not os.path.exists(img_path):
                 raise Exception(f'FileNotFound! {img_path}')
             
-            # 1. 读取原图
             img = Image.open(img_path)
 
-            # 🔥🔥🔥【核心修改】在这里强制 Resize 图片像素 🔥🔥🔥
             if self.resize is not None:
-                # Config 里的格式是 [H, W], 但 PIL resize 需要 (W, H)
                 target_h, target_w = self.resize[0], self.resize[1]
-                
-                # 只有当尺寸不一致时才进行缩放
                 if img.size != (target_w, target_h):
                     img = img.resize((target_w, target_h), Image.BILINEAR)
-            # --------------------------------------------------------
 
-            # 2. 再进行 transform (ToTensor, Normalize 等)
             img_tensor = self.img_transforms(img)
             imgs.append(img_tensor)
 
@@ -133,7 +124,7 @@ class BaseDataset(Dataset):
         intrinsics_list = []
         
         for cam_name in channels:
-            cam_info = info['cam_infos'][cam_name]
+            cam_info = info['camera_infos'][cam_name]
             cam_calib = cam_info['calibrated_sensor']
             
             cam_translation = np.array(cam_calib['translation'])
@@ -183,76 +174,58 @@ class BaseDataset(Dataset):
 
 
 class RobustnessAugmentation:
-    """物理噪声增强：LiDAR的Jitter/Dropout，Camera的Darkness/Noise"""
-    def __init__(self, stage=1):
+    def __init__(self, stage=1, clean_prob=0.5):
         self.stage = stage
+        self.clean_prob = clean_prob
         
     def apply_lidar_aug(self, gaussians):
-        """
-        对LiDAR数据应用Jitter和Dropout
-        适配输入形状: [N, D] (单个样本) 或 [B, N, D] (Batch)
-        """
-        if self.stage == 1:  # Clean stage
+        if self.stage == 1 or torch.rand(1).item() < self.clean_prob:
             return gaussians
         
-        # Stage 2: Robust stage - 应用物理噪声
         gaussians = gaussians.clone()
         
-        # 自动识别维度
-        if gaussians.dim() == 2:
-            # 单个样本 [N, D]
-            N, D = gaussians.shape
-            # Jitter: 对xyz坐标添加小噪声
-            if torch.rand(1).item() < 0.5:
-                noise_scale = 0.05
+        if torch.rand(1).item() < 0.5:
+            noise_scale = 0.05
+            if gaussians.dim() == 2:
                 gaussians[:, :3] += torch.randn_like(gaussians[:, :3]) * noise_scale
-            
-            # Dropout: 随机丢弃一些点 (置零)
-            if torch.rand(1).item() < 0.3:
-                dropout_rate = 0.1
-                # 生成 [N, 1] 的 mask
-                mask = torch.rand(N, 1, device=gaussians.device) > dropout_rate
-                gaussians = gaussians * mask.float()
-
-        elif gaussians.dim() == 3:
-            # Batch 样本 [B, N, D]
-            B, N, D = gaussians.shape
-            if torch.rand(1).item() < 0.5:
-                noise_scale = 0.05
+            elif gaussians.dim() == 3:
                 gaussians[:, :, :3] += torch.randn_like(gaussians[:, :, :3]) * noise_scale
             
-            if torch.rand(1).item() < 0.3:
-                dropout_rate = 0.1
-                mask = torch.rand(B, N, 1, device=gaussians.device) > dropout_rate
-                gaussians = gaussians * mask.float()
+            dropout_rate = 0.1
+            mask = torch.rand(gaussians.shape[:-1] + (1,), device=gaussians.device) > dropout_rate
+            gaussians = gaussians * mask.float()
         
         return gaussians
     
     def apply_camera_aug(self, images):
-        """
-        对Camera数据应用Darkness和Noise
-        适配输入形状: [V, C, H, W] (单个样本) 或 [B, V, C, H, W] (Batch)
-        """
-        if self.stage == 1:  # Clean stage
+        if self.stage == 1 or torch.rand(1).item() < self.clean_prob:
             return images
         
-        # Stage 2: Robust stage
         images = images.clone()
         
-        # 这里的关键修复是去掉固定的 B, V, C, H, W 解包
-        # 因为在 Dataset 中调用时，没有 Batch 维度
+        dropout_prob = torch.rand(1).item()
+        valid_views = torch.ones(6, dtype=torch.bool)
         
-        # Darkness: 随机降低亮度
-        if torch.rand(1).item() < 0.4:
-            dark_factor = 0.6 + 0.3 * torch.rand(1).item()  # [0.6, 0.9]
-            images = images * dark_factor
-        
-        # Noise: 添加高斯噪声
-        if torch.rand(1).item() < 0.4:
-            noise_std = 0.02
-            noise = torch.randn_like(images) * noise_std
-            images = torch.clamp(images + noise, 0.0, 1.0)
-        
+        if dropout_prob < 0.4:
+            images[1:] = 0.0
+            valid_views[1:] = False
+        elif dropout_prob < 0.7:
+            num_drop = torch.randint(1, 4, (1,)).item()
+            drop_indices = torch.randperm(6)[:num_drop]
+            images[drop_indices] = 0.0
+            valid_views[drop_indices] = False
+            
+        deg_prob = torch.rand(1).item()
+        if deg_prob < 0.3:
+            dark_factor = 0.1 + 0.2 * torch.rand(1).item()
+            images[valid_views] = images[valid_views] * dark_factor
+            noise_std = 0.05
+            noise = torch.randn_like(images[valid_views]) * noise_std
+            images[valid_views] = torch.clamp(images[valid_views] + noise, 0.0, 1.0)
+        elif deg_prob < 0.5:
+            glare_factor = 1.5 + 1.0 * torch.rand(1).item()
+            images[valid_views] = torch.clamp(images[valid_views] * glare_factor, 0.0, 1.0)
+            
         return images
 
 
@@ -268,8 +241,8 @@ class TripletDataset(BaseDataset):
         self.margin = margin
         self.queries = np.load(query_path)
         self.img_transforms = img_transforms
-        self.stage = 1  # 默认Stage 1 (Clean)
-        self.robust_aug = RobustnessAugmentation(stage=self.stage)
+        self.stage = 1
+        self.robust_aug = RobustnessAugmentation(stage=self.stage, clean_prob=1.0)
 
         knn = NearestNeighbors()
         knn.fit(self.data_base[:, 1:])
@@ -289,10 +262,10 @@ class TripletDataset(BaseDataset):
         self.cache = os.path.join(cache_dir, 'feat_cache.hdf5')
         self.negCache = [np.empty((0,)) for _ in range(len(self.queries))]
     
-    def set_stage(self, stage):
-        """设置训练阶段：1=Clean, 2=Robust"""
+    def set_stage(self, stage, clean_prob=0.5):
         self.stage = stage
         self.robust_aug.stage = stage
+        self.robust_aug.clean_prob = clean_prob
 
     def __getitem__(self, index):
         with h5py.File(self.cache, mode='r') as h5:
@@ -319,12 +292,9 @@ class TripletDataset(BaseDataset):
 
             vilatingNeg = negdist.numpy() < posdist.numpy() + self.margin
             if np.sum(vilatingNeg) < 1:
-                # 🔥 CRITICAL FIX: Stage 2必须强制返回，不能返回None
                 if self.stage == 2:
-                    # 在Stage 2，选择最难的负样本（距离最近的）
-                    negidx = negidx[:self.nNeg]  # 强制选择top-k最难的
+                    negidx = negidx[:self.nNeg]
                 else:
-                    # Stage 1: 严格遵循margin，找不到就返回None
                     return None
             else:
                 negidx = negidx[vilatingNeg][:self.nNeg]
@@ -345,8 +315,6 @@ class TripletDataset(BaseDataset):
         images_list, gaussians_list, extrinsics_list, intrinsics_list = [], [], [], []
         for i in range(len(neg_idx)):
             neg_dict = self.load_data_with_matrices(neg_idx[i])
-            # 🔥 应用Robustness Augmentation (Stage 2)
-            # Negative样本保持独立随机增强
             neg_dict['images'] = self.robust_aug.apply_camera_aug(neg_dict['images'])
             neg_dict['gaussians'] = self.robust_aug.apply_lidar_aug(neg_dict['gaussians'])
             images_list.append(neg_dict['images'])
@@ -354,33 +322,12 @@ class TripletDataset(BaseDataset):
             extrinsics_list.append(neg_dict['extrinsics'])
             intrinsics_list.append(neg_dict['intrinsics'])
 
-        # 🔥 FIX: Paired Consistency Augmentation for Query and Positive (Stage 2)
         if self.stage == 2:
-            # 生成共享的随机种子，确保Query和Positive使用相同的增强
-            shared_seed = torch.randint(0, 2**31, (1,)).item()
-            
-            # 保存当前随机状态
-            torch_state_old = torch.get_rng_state()
-            np_state_old = np.random.get_state()
-            
-            # 为Positive应用增强（使用共享种子）
-            torch.manual_seed(shared_seed)
-            np.random.seed(shared_seed)
             pos_dict['images'] = self.robust_aug.apply_camera_aug(pos_dict['images'])
             pos_dict['gaussians'] = self.robust_aug.apply_lidar_aug(pos_dict['gaussians'])
             
-            # 为Query应用增强（使用相同的共享种子）
-            torch.manual_seed(shared_seed)
-            np.random.seed(shared_seed)
             q_dict['images'] = self.robust_aug.apply_camera_aug(q_dict['images'])
             q_dict['gaussians'] = self.robust_aug.apply_lidar_aug(q_dict['gaussians'])
-            
-            # 恢复随机状态，避免影响后续操作
-            torch.set_rng_state(torch_state_old)
-            np.random.set_state(np_state_old)
-        else:
-            # Stage 1: 不应用增强
-            pass
         
         images_list.extend([pos_dict['images'], q_dict['images']])
         gaussians_list.extend([pos_dict['gaussians'], q_dict['gaussians']])
